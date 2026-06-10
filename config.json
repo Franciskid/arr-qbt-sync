@@ -1,0 +1,25 @@
+{
+  "arr_to_qbt_paths": {
+    "/movies1": "/Media/Movies",
+    "/movies3": "/media3/Movies",
+    "/movies4": "/media4/Movies",
+    "/movies5": "/media5/Movies",
+    "/movies6": "/media6/Movies",
+    "/tv1": "/Media/TV Shows",
+    "/tv2": "/media2/TV Shows",
+    "/tv4": "/media4/TV Shows",
+    "/tv5": "/media5/TV Shows",
+    "/tv6": "/media6/TV Shows",
+    "/data": "/data"
+  },
+  "video_extensions": [
+    ".mkv",
+    ".mp4",
+    ".avi",
+    ".mov",
+    ".m4v",
+    ".ts",
+    ".m2ts",
+    ".wmv"
+  ]
+}
