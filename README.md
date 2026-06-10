@@ -1,12 +1,16 @@
 # arr-qbt-sync
 
-Radarr and Sonarr can import a download into the library, but qBittorrent may
-keep pointing at the old download path. That leaves duplicate hardlinks,
-broken seeding paths, or old folders that never get cleaned up.
+Hardlinks only work when the download and library are on the same filesystem.
+With multiple drives, a download in qBittorrent's default data folder cannot
+be hardlinked into a Radarr or Sonarr library on another drive. Arr has to copy
+it, wasting space, or move it, which breaks the path qBittorrent uses for
+seeding.
 
 This script runs as a Radarr or Sonarr custom script after an import. It updates
-the torrent to use the final library path, asks qBittorrent to recheck it, then
-removes the old source only when the new path is valid.
+qBittorrent to use the imported file in its final library location. It then
+rechecks the torrent and removes the old source only when the new path is
+valid. The result is one library copy that can still be seeded, even when the
+download and library are on different drives.
 
 ## Setup
 
