@@ -381,19 +381,33 @@ class QBittorrentClient:
 
 	def rename_folder(self, download_id, old_path, new_path):
 		log(f"qBittorrent renameFolder: {old_path} -> {new_path}")
-		self._request(
-			"/api/v2/torrents/renameFolder",
-			method="POST",
-			data={"hash": download_id, "oldPath": old_path, "newPath": new_path},
-		)
+		try:
+			self._request(
+				"/api/v2/torrents/renameFolder",
+				method="POST",
+				data={"hash": download_id, "oldPath": old_path, "newPath": new_path},
+			)
+		except urllib.error.HTTPError as error:
+			# qBittorrent returns 409 when newPath is already in use, which
+			# happens on same-drive imports because Arr has already hardlinked
+			# the file into its final folder. Treat as a soft failure so the
+			# caller can skip destructive cleanup instead of crashing mid-run.
+			log(f"qBittorrent renameFolder rejected ({error.code}); destination likely already exists: {new_path}")
+			return False
+		return True
 
 	def rename_file(self, download_id, old_path, new_path):
 		log(f"qBittorrent renameFile: {old_path} -> {new_path}")
-		self._request(
-			"/api/v2/torrents/renameFile",
-			method="POST",
-			data={"hash": download_id, "oldPath": old_path, "newPath": new_path},
-		)
+		try:
+			self._request(
+				"/api/v2/torrents/renameFile",
+				method="POST",
+				data={"hash": download_id, "oldPath": old_path, "newPath": new_path},
+			)
+		except urllib.error.HTTPError as error:
+			log(f"qBittorrent renameFile rejected ({error.code}); destination likely already exists: {new_path}")
+			return False
+		return True
 
 	def set_location(self, download_id, location):
 		log(f"qBittorrent setLocation: {location}")
@@ -565,22 +579,56 @@ def finalize_transfer(app_name, qbt, download_id, state):
 	log(f"finalize: save_path={torrent.get('save_path')} location_changed={location_changed}")
 	log(f"finalize: old_root={old_root} desired_root_rel={desired_root_rel}")
 
+	# Track whether qBittorrent's paths were fully re-pointed to the library
+	# location. When a rename is rejected (typically because Arr already placed
+	# the imported file at the destination on the same drive), qBittorrent keeps
+	# its original paths, so we must NOT delete the source folder afterwards or
+	# we would break seeding and leave Arr pointing at a relocated file.
+	repoint_complete = True
+
 	if old_root and desired_root_rel and old_root != desired_root_rel:
-		qbt.rename_folder(download_id, old_root, desired_root_rel)
-		file_names = [
-			desired_root_rel + name[len(old_root):] if name == old_root or name.startswith(old_root + "/") else name
-			for name in file_names
-		]
+		if qbt.rename_folder(download_id, old_root, desired_root_rel):
+			file_names = [
+				desired_root_rel + name[len(old_root):] if name == old_root or name.startswith(old_root + "/") else name
+				for name in file_names
+			]
+		else:
+			repoint_complete = False
 
 	for mapping in mappings:
 		desired_rel = os.path.relpath(mapping["imported_path_qbt"], library_root_qbt).replace("\\", "/")
-		current_rel = match_current_relative(file_names, desired_rel)
+		try:
+			current_rel = match_current_relative(file_names, desired_rel)
+		except ValueError as error:
+			log(f"Skipping file re-point: {error}")
+			repoint_complete = False
+			continue
 		if current_rel != desired_rel:
-			qbt.rename_file(download_id, current_rel, desired_rel)
-			file_names[file_names.index(current_rel)] = desired_rel
+			if qbt.rename_file(download_id, current_rel, desired_rel):
+				file_names[file_names.index(current_rel)] = desired_rel
+			else:
+				repoint_complete = False
 
 	if location_changed:
 		qbt.set_location(download_id, library_root_qbt)
+
+	if not repoint_complete:
+		log(
+			f"qBittorrent kept its original file paths (destination already populated by {app_name}); "
+			f"leaving the source folder in place to avoid breaking seeding or {app_name} tracking: {source_folder_arr}"
+		)
+		qbt.recheck(download_id)
+		torrent = qbt.wait_for_recheck(download_id)
+		if torrent.get("progress", 0) >= 0.9999:
+			qbt.resume(download_id)
+			log(f"Recheck passed for {download_id}; resumed seeding from existing paths")
+		else:
+			log(
+				f"Recheck incomplete for {download_id} after partial re-point; "
+				"qBittorrent may report missing files until paths are reconciled on a later event"
+			)
+		# Preserve state so a subsequent Arr event can retry the re-point.
+		return
 
 	# Move remaining non-torrent debris from original source folder
 	can_move_source_folder = not is_arr_root_path(source_folder_arr)

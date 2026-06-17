@@ -2,6 +2,7 @@ import importlib.util
 import os
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest import mock
 
@@ -91,6 +92,67 @@ class RecheckTests(unittest.TestCase):
 		result = client.wait_for_recheck("hash", timeout_seconds=20)
 
 		self.assertEqual(result["progress"], 1)
+
+
+class RenameResilienceTests(unittest.TestCase):
+	def _client(self):
+		return object.__new__(arr_qbt_sync.QBittorrentClient)
+
+	def test_rename_folder_returns_true_on_success(self):
+		client = self._client()
+		client._request = mock.Mock(return_value=b"")
+		self.assertTrue(client.rename_folder("hash", "old", "new"))
+
+	def test_rename_folder_soft_fails_on_conflict(self):
+		client = self._client()
+		client._request = mock.Mock(
+			side_effect=urllib.error.HTTPError("url", 409, "Conflict", {}, None)
+		)
+		# Must not raise: a 409 (destination already in use) means Arr already
+		# placed the file, so finalize should be able to skip cleanup safely.
+		self.assertFalse(client.rename_folder("hash", "old", "new"))
+
+	def test_rename_file_soft_fails_on_conflict(self):
+		client = self._client()
+		client._request = mock.Mock(
+			side_effect=urllib.error.HTTPError("url", 409, "Conflict", {}, None)
+		)
+		self.assertFalse(client.rename_file("hash", "old", "new"))
+
+
+class FinalizeRepointTests(unittest.TestCase):
+	def _state(self):
+		return {
+			"source_folder_arr": "/movies6/Movie.RELEASE",
+			"target_root_arr": "/movies6/Movie (2026)",
+			"target_root_qbt": "/media6/Movies/Movie (2026)",
+			"library_root_qbt": "/media6/Movies",
+			"mappings": [
+				arr_qbt_sync.build_mapping(
+					"/movies6/Movie.RELEASE/Movie.RELEASE.mkv",
+					"/movies6/Movie (2026)/Movie.RELEASE.mkv",
+				)
+			],
+		}
+
+	def test_failed_renamefolder_skips_source_removal(self):
+		qbt = mock.Mock()
+		qbt.get_torrent.return_value = {"save_path": "/media6/Movies", "state": "stalledUP", "progress": 1}
+		qbt.get_files.return_value = [{"name": "Movie.RELEASE/Movie.RELEASE.mkv"}]
+		qbt.rename_folder.return_value = False  # qBittorrent rejects the rename
+		qbt.wait_for_recheck.return_value = {"progress": 1}
+
+		with mock.patch.object(arr_qbt_sync, "remove_source_folder") as remove_source, \
+			mock.patch.object(arr_qbt_sync, "move_remaining_source_items") as move_remaining, \
+			mock.patch.object(arr_qbt_sync, "clear_state") as clear_state:
+			arr_qbt_sync.finalize_transfer("radarr", qbt, "hash", self._state())
+
+		# The whole point of the fix: never delete the source folder or wipe
+		# state when qBittorrent kept its original paths.
+		remove_source.assert_not_called()
+		move_remaining.assert_not_called()
+		clear_state.assert_not_called()
+		qbt.recheck.assert_called_once()
 
 
 if __name__ == "__main__":
