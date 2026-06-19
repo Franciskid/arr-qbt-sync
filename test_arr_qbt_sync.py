@@ -77,6 +77,61 @@ class RootLinkCleanupTests(unittest.TestCase):
 			self.assertTrue(source.exists())
 
 
+class SourceCleanupGuardTests(unittest.TestCase):
+	def test_move_remaining_blocks_conflicting_video_destination(self):
+		with tempfile.TemporaryDirectory() as temp_dir:
+			root = Path(temp_dir)
+			source = root / "source"
+			target = root / "target"
+			source.mkdir()
+			target.mkdir()
+			(source / "movie.mkv").write_bytes(b"source")
+			(target / "movie.mkv").write_bytes(b"target")
+
+			result = arr_qbt_sync.move_remaining_source_items(str(source), str(target))
+
+			self.assertFalse(result)
+			self.assertEqual((source / "movie.mkv").read_bytes(), b"source")
+			self.assertEqual((target / "movie.mkv").read_bytes(), b"target")
+
+	def test_remove_source_folder_refuses_unique_video(self):
+		with tempfile.TemporaryDirectory() as temp_dir:
+			root = Path(temp_dir)
+			source = root / "release"
+			source.mkdir()
+			(source / "movie.mkv").write_bytes(b"source")
+
+			result = arr_qbt_sync.remove_source_folder(str(source), [])
+
+			self.assertFalse(result)
+			self.assertTrue(source.exists())
+			self.assertTrue((source / "movie.mkv").exists())
+
+	def test_remove_source_folder_allows_samefile_imported_video(self):
+		with tempfile.TemporaryDirectory() as temp_dir:
+			root = Path(temp_dir)
+			source = root / "release"
+			target = root / "Movie (2026)"
+			source.mkdir()
+			target.mkdir()
+			source_file = source / "movie.mkv"
+			target_file = target / "movie.mkv"
+			source_file.write_bytes(b"movie")
+			os.link(source_file, target_file)
+
+			result = arr_qbt_sync.remove_source_folder(
+				str(source),
+				[{
+					"source_path_arr": str(source_file),
+					"imported_path_arr": str(target_file),
+				}],
+			)
+
+			self.assertTrue(result)
+			self.assertFalse(source.exists())
+			self.assertEqual(target_file.read_bytes(), b"movie")
+
+
 class RecheckTests(unittest.TestCase):
 	@mock.patch.object(arr_qbt_sync.time, "sleep")
 	def test_waits_for_delayed_check_to_finish(self, _sleep):

@@ -241,33 +241,84 @@ def torrent_video_count(files):
 	return sum(1 for item in files if is_video_file(item["name"]))
 
 
+def same_file(left, right):
+	try:
+		return Path(left).exists() and Path(right).exists() and os.path.samefile(left, right)
+	except OSError:
+		return False
+
+
+def imported_match_for_source(source_path, mappings):
+	for mapping in mappings:
+		if Path(mapping["source_path_arr"]) == Path(source_path):
+			return mapping["imported_path_arr"]
+	return None
+
+
 def move_remaining_source_items(source_folder, target_folder):
 	source = Path(source_folder)
 	target = Path(target_folder)
 	if not source.exists():
 		log(f"move_remaining: source does not exist: {source}")
-		return
+		return True
 	target.mkdir(parents=True, exist_ok=True)
 	children = list(source.iterdir())
 	log(f"move_remaining: {len(children)} items in {source} -> {target}")
+	safe_to_remove_source = True
 	for child in children:
 		destination = target / child.name
 		if destination.exists():
-			log(f"move_remaining: skip (exists): {child.name}")
+			if child.is_file() and is_video_file(child.name) and not same_file(child, destination):
+				log(
+					"move_remaining: blocking cleanup; destination video already exists "
+					f"but is not the same file: {destination}"
+				)
+				safe_to_remove_source = False
+			else:
+				log(f"move_remaining: skip (exists): {child.name}")
 			continue
 		shutil.move(str(child), str(destination))
 		log(f"move_remaining: moved {child.name}")
+	return safe_to_remove_source
 
 
-def remove_source_folder(source_folder):
+def source_folder_has_unique_video(source_folder, mappings):
+	source = Path(source_folder)
+	for child in source.rglob("*"):
+		if not child.is_file() or not is_video_file(child.name):
+			continue
+		imported_path = imported_match_for_source(child, mappings)
+		if imported_path and same_file(child, imported_path):
+			continue
+		log(f"remove_source: blocking cleanup; unique video remains in source: {child}")
+		return True
+	return False
+
+
+def imported_videos_are_present(mappings):
+	for mapping in mappings:
+		imported = Path(mapping["imported_path_arr"])
+		if not imported.is_file():
+			log(f"cleanup guard: imported video is missing: {imported}")
+			return False
+		if imported.stat().st_size <= 0:
+			log(f"cleanup guard: imported video is empty: {imported}")
+			return False
+	return True
+
+
+def remove_source_folder(source_folder, mappings):
 	source = Path(source_folder)
 	if not source.exists():
 		log(f"remove_source: does not exist: {source}")
-		return
+		return True
+	if source_folder_has_unique_video(source_folder, mappings):
+		return False
 	remaining = list(source.rglob("*"))
 	log(f"remove_source: deleting {source} ({len(remaining)} items remaining)")
 	shutil.rmtree(source)
 	log(f"remove_source: deleted {source}")
+	return True
 
 
 def remove_empty_parents(folder, stop_at):
@@ -630,10 +681,13 @@ def finalize_transfer(app_name, qbt, download_id, state):
 		# Preserve state so a subsequent Arr event can retry the re-point.
 		return
 
-	# Move remaining non-torrent debris from original source folder
+	# Move remaining non-torrent debris from original source folder. If a video
+	# conflict remains in the source, keep the source folder and state so a later
+	# event or manual check can reconcile it without data loss.
 	can_move_source_folder = not is_arr_root_path(source_folder_arr)
+	cleanup_safe = True
 	if can_move_source_folder:
-		move_remaining_source_items(source_folder_arr, target_root_arr)
+		cleanup_safe = move_remaining_source_items(source_folder_arr, target_root_arr)
 	else:
 		log(f"Skipping unsafe move_remaining from Arr root: {source_folder_arr}")
 
@@ -650,7 +704,10 @@ def finalize_transfer(app_name, qbt, download_id, state):
 			if candidate != source_folder_arr:
 				renamed_source_arr = candidate
 				if not is_arr_root_path(renamed_source_arr):
-					move_remaining_source_items(renamed_source_arr, target_root_arr)
+					cleanup_safe = (
+						move_remaining_source_items(renamed_source_arr, target_root_arr)
+						and cleanup_safe
+					)
 				else:
 					log(f"Skipping unsafe move_remaining from Arr root: {renamed_source_arr}")
 
@@ -660,20 +717,29 @@ def finalize_transfer(app_name, qbt, download_id, state):
 		fail(f"Recheck did not complete successfully for {download_id}; leaving source folder in place")
 	qbt.resume(download_id)
 
+	if not imported_videos_are_present(mappings):
+		fail(f"Imported files are not safely present for {download_id}; leaving source folder in place")
+
 	# Remove source folder(s)
 	remove_root_level_source_links(source_folder_arr, mappings)
 	if can_move_source_folder:
-		remove_source_folder(source_folder_arr)
+		cleanup_safe = remove_source_folder(source_folder_arr, mappings) and cleanup_safe
 	else:
 		log(f"Skipping unsafe source folder removal for Arr root: {source_folder_arr}")
 	if renamed_source_arr:
 		if not is_arr_root_path(renamed_source_arr):
-			remove_source_folder(renamed_source_arr)
+			cleanup_safe = remove_source_folder(renamed_source_arr, mappings) and cleanup_safe
 		else:
 			log(f"Skipping unsafe source folder removal for Arr root: {renamed_source_arr}")
 		source_root_arr, _ = longest_prefix_match(source_folder_arr, ARR_TO_QBT_PATHS)
 		if source_root_arr:
 			remove_empty_parents(renamed_source_arr, source_root_arr)
+
+	if not cleanup_safe:
+		log(
+			f"Cleanup left source files in place for {download_id}; preserving state for a later retry"
+		)
+		return
 
 	clear_state(app_name, download_id)
 	log(f"Finalized torrent sync for {download_id}")
