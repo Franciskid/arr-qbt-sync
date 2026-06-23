@@ -36,19 +36,22 @@ def load_config(path):
 		raise RuntimeError(f"Unable to load configuration from {path}: {error}") from error
 
 	path_mappings = config.get("arr_to_qbt_paths")
+	jellyfin_path_mappings = config.get("arr_to_jellyfin_paths", {})
 	video_extensions = config.get("video_extensions")
 	if not isinstance(path_mappings, dict) or not path_mappings:
 		raise RuntimeError("config.json must define a non-empty arr_to_qbt_paths object")
+	if not isinstance(jellyfin_path_mappings, dict):
+		raise RuntimeError("config.json arr_to_jellyfin_paths must be an object when defined")
 	if not isinstance(video_extensions, list) or not video_extensions:
 		raise RuntimeError("config.json must define a non-empty video_extensions list")
 
-	return path_mappings, {
+	return path_mappings, jellyfin_path_mappings, {
 		extension.lower() if extension.startswith(".") else f".{extension.lower()}"
 		for extension in video_extensions
 	}
 
 
-ARR_TO_QBT_PATHS, VIDEO_EXTENSIONS = load_config(CONFIG_PATH)
+ARR_TO_QBT_PATHS, ARR_TO_JELLYFIN_PATHS, VIDEO_EXTENSIONS = load_config(CONFIG_PATH)
 
 
 def log(message):
@@ -97,6 +100,16 @@ def qbt_library_root_for_arr_path(path_str):
 	if prefix is None:
 		raise ValueError(f"No library root mapping for: {path_str}")
 	return ARR_TO_QBT_PATHS[prefix]
+
+
+def arr_to_jellyfin(path_str):
+	if not path_str:
+		return ""
+	prefix, target = longest_prefix_match(path_str, ARR_TO_JELLYFIN_PATHS)
+	if prefix is None:
+		return ""
+	suffix = path_str[len(prefix):]
+	return target + suffix
 
 
 def is_arr_root_path(path_str):
@@ -224,6 +237,88 @@ def clear_state(app_name, download_id):
 		path.unlink()
 
 
+def jellyfin_scan_config():
+	url = os.getenv("ARR_QBT_JELLYFIN_URL", "").rstrip("/")
+	api_key = os.getenv("ARR_QBT_JELLYFIN_API_KEY", "")
+	if not url or not api_key:
+		return None
+	return {
+		"url": url,
+		"api_key": api_key,
+	}
+
+
+def jellyfin_request(config, path, method="GET"):
+	request = urllib.request.Request(
+		config["url"] + path,
+		headers={"X-Emby-Token": config["api_key"]},
+		method=method,
+	)
+	with urllib.request.urlopen(request, timeout=30) as response:
+		return response.read()
+
+
+def jellyfin_item_matches_path(item_path, jellyfin_root_path):
+	if not item_path or not jellyfin_root_path:
+		return False
+	return item_path == jellyfin_root_path or item_path.startswith(jellyfin_root_path.rstrip("/") + "/")
+
+
+def find_jellyfin_item_id(config, item_root_arr):
+	jellyfin_root_path = arr_to_jellyfin(item_root_arr)
+	if not jellyfin_root_path:
+		log(f"Jellyfin targeted refresh skipped; no path mapping for {item_root_arr}")
+		return None
+
+	search_term = Path(item_root_arr).name
+	query = urllib.parse.urlencode({
+		"Recursive": "true",
+		"IncludeItemTypes": "Series,Movie",
+		"Fields": "Path",
+		"SearchTerm": search_term,
+		"Limit": "50",
+	})
+	raw = jellyfin_request(config, f"/Items?{query}")
+	for item in json.loads(raw).get("Items", []):
+		if jellyfin_item_matches_path(item.get("Path", ""), jellyfin_root_path):
+			return item.get("Id")
+
+	log(f"Jellyfin targeted refresh skipped; item not found for {jellyfin_root_path}")
+	return None
+
+
+def refresh_jellyfin_item(config, item_id):
+	query = urllib.parse.urlencode({
+		"Recursive": "true",
+		"MetadataRefreshMode": "Default",
+		"ImageRefreshMode": "Default",
+		"ReplaceAllMetadata": "false",
+		"ReplaceAllImages": "false",
+	})
+	jellyfin_request(config, f"/Items/{item_id}/Refresh?{query}", method="POST")
+	log(f"Jellyfin item refresh requested for {item_id}")
+
+
+def trigger_jellyfin_scan(item_root_arr=None):
+	config = jellyfin_scan_config()
+	if not config:
+		log("Jellyfin scan skipped; ARR_QBT_JELLYFIN_URL/API_KEY are not configured")
+		return False
+
+	try:
+		jellyfin_request(config, "/Library/Refresh", method="POST")
+		if item_root_arr:
+			item_id = find_jellyfin_item_id(config, item_root_arr)
+			if item_id:
+				refresh_jellyfin_item(config, item_id)
+	except (OSError, urllib.error.HTTPError, urllib.error.URLError) as error:
+		log(f"Jellyfin scan request failed: {error}")
+		return False
+
+	log("Jellyfin library scan requested")
+	return True
+
+
 def build_mapping(source_path_arr, imported_path_arr):
 	return {
 		"source_path_arr": source_path_arr,
@@ -319,6 +414,13 @@ def remove_source_folder(source_folder, mappings):
 	shutil.rmtree(source)
 	log(f"remove_source: deleted {source}")
 	return True
+
+
+def cleanup_finished(source_folder, renamed_source_folder):
+	paths = [source_folder]
+	if renamed_source_folder:
+		paths.append(renamed_source_folder)
+	return all(not Path(path).exists() for path in paths)
 
 
 def remove_empty_parents(folder, stop_at):
@@ -580,6 +682,9 @@ def collect_event(app_name):
 
 	if app_name == "sonarr":
 		imported_path = normalize_sonarr_target_paths(source_folder, source_path, imported_path, series_path)
+		library_item_root_arr = series_path
+	else:
+		library_item_root_arr = str(Path(imported_path).parent)
 
 	return {
 		"download_id": download_id,
@@ -592,6 +697,7 @@ def collect_event(app_name):
 		"target_root_arr": str(Path(imported_path).parent),
 		"target_root_qbt": str(Path(arr_to_qbt(imported_path)).parent),
 		"library_root_qbt": qbt_library_root_for_arr_path(imported_path),
+		"library_item_root_arr": library_item_root_arr,
 	}
 
 
@@ -606,6 +712,7 @@ def merge_mapping(state, event):
 	state["target_root_arr"] = event["target_root_arr"]
 	state["target_root_qbt"] = event["target_root_qbt"]
 	state["library_root_qbt"] = event["library_root_qbt"]
+	state["library_item_root_arr"] = event["library_item_root_arr"]
 	return state
 
 
@@ -614,6 +721,7 @@ def finalize_transfer(app_name, qbt, download_id, state):
 	target_root_arr = state["target_root_arr"]
 	target_root_qbt = state["target_root_qbt"]
 	library_root_qbt = state["library_root_qbt"]
+	library_item_root_arr = state.get("library_item_root_arr", target_root_arr)
 	mappings = state["mappings"]
 
 	torrent = qbt.get_torrent(download_id)
@@ -736,12 +844,18 @@ def finalize_transfer(app_name, qbt, download_id, state):
 			remove_empty_parents(renamed_source_arr, source_root_arr)
 
 	if not cleanup_safe:
-		log(
-			f"Cleanup left source files in place for {download_id}; preserving state for a later retry"
-		)
-		return
+		if cleanup_finished(source_folder_arr, renamed_source_arr):
+			log(
+				f"Cleanup warnings were resolved for {download_id}; source folders are gone"
+			)
+		else:
+			log(
+				f"Cleanup left source files in place for {download_id}; preserving state for a later retry"
+			)
+			return
 
 	clear_state(app_name, download_id)
+	trigger_jellyfin_scan(library_item_root_arr)
 	log(f"Finalized torrent sync for {download_id}")
 
 

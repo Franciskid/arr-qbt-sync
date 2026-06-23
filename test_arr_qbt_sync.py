@@ -25,6 +25,12 @@ class PathMappingTests(unittest.TestCase):
 			"/media6/Movies/Smile (2022)/movie.mkv",
 		)
 
+	def test_jellyfin_mapping_is_used(self):
+		self.assertEqual(
+			arr_qbt_sync.arr_to_jellyfin("/tv6/Clarkson's Farm"),
+			"/media6:ro/TV Shows/Clarkson's Farm",
+		)
+
 	def test_video_extensions_come_from_config(self):
 		self.assertTrue(arr_qbt_sync.is_video_file("movie.MKV"))
 		self.assertFalse(arr_qbt_sync.is_video_file("poster.jpg"))
@@ -131,6 +137,17 @@ class SourceCleanupGuardTests(unittest.TestCase):
 			self.assertFalse(source.exists())
 			self.assertEqual(target_file.read_bytes(), b"movie")
 
+	def test_cleanup_finished_requires_all_source_folders_gone(self):
+		with tempfile.TemporaryDirectory() as temp_dir:
+			root = Path(temp_dir)
+			source = root / "source"
+			renamed = root / "renamed"
+			source.mkdir()
+
+			self.assertFalse(arr_qbt_sync.cleanup_finished(str(source), str(renamed)))
+			source.rmdir()
+			self.assertTrue(arr_qbt_sync.cleanup_finished(str(source), str(renamed)))
+
 
 class RecheckTests(unittest.TestCase):
 	@mock.patch.object(arr_qbt_sync.time, "sleep")
@@ -182,6 +199,7 @@ class FinalizeRepointTests(unittest.TestCase):
 			"target_root_arr": "/movies6/Movie (2026)",
 			"target_root_qbt": "/media6/Movies/Movie (2026)",
 			"library_root_qbt": "/media6/Movies",
+			"library_item_root_arr": "/movies6/Movie (2026)",
 			"mappings": [
 				arr_qbt_sync.build_mapping(
 					"/movies6/Movie.RELEASE/Movie.RELEASE.mkv",
@@ -193,7 +211,10 @@ class FinalizeRepointTests(unittest.TestCase):
 	def test_failed_renamefolder_skips_source_removal(self):
 		qbt = mock.Mock()
 		qbt.get_torrent.return_value = {"save_path": "/media6/Movies", "state": "stalledUP", "progress": 1}
-		qbt.get_files.return_value = [{"name": "Movie.RELEASE/Movie.RELEASE.mkv"}]
+		qbt.get_files.return_value = [
+			{"name": "Movie.RELEASE/Movie.RELEASE.mkv"},
+			{"name": "Movie.RELEASE/poster.jpg"},
+		]
 		qbt.rename_folder.return_value = False  # qBittorrent rejects the rename
 		qbt.wait_for_recheck.return_value = {"progress": 1}
 
@@ -208,6 +229,47 @@ class FinalizeRepointTests(unittest.TestCase):
 		move_remaining.assert_not_called()
 		clear_state.assert_not_called()
 		qbt.recheck.assert_called_once()
+
+	def test_successful_finalize_triggers_jellyfin_scan_after_clearing_state(self):
+		qbt = mock.Mock()
+		qbt.get_torrent.return_value = {"save_path": "/media6/Movies", "state": "stalledUP", "progress": 1}
+		qbt.get_files.return_value = [
+			{"name": "Movie.RELEASE/Movie.RELEASE.mkv"},
+			{"name": "Movie.RELEASE/poster.jpg"},
+		]
+		qbt.rename_folder.return_value = True
+		qbt.wait_for_recheck.return_value = {"progress": 1}
+
+		with mock.patch.object(arr_qbt_sync, "move_remaining_source_items", return_value=True), \
+			mock.patch.object(arr_qbt_sync, "remove_source_folder", return_value=True), \
+			mock.patch.object(arr_qbt_sync, "imported_videos_are_present", return_value=True), \
+			mock.patch.object(arr_qbt_sync, "clear_state") as clear_state, \
+			mock.patch.object(arr_qbt_sync, "trigger_jellyfin_scan") as trigger_scan:
+			arr_qbt_sync.finalize_transfer("radarr", qbt, "hash", self._state())
+
+		clear_state.assert_called_once_with("radarr", "hash")
+		trigger_scan.assert_called_once_with("/movies6/Movie (2026)")
+
+	def test_cleanup_warning_does_not_preserve_state_when_source_is_gone(self):
+		qbt = mock.Mock()
+		qbt.get_torrent.return_value = {"save_path": "/media6/Movies", "state": "stalledUP", "progress": 1}
+		qbt.get_files.return_value = [
+			{"name": "Movie.RELEASE/Movie.RELEASE.mkv"},
+			{"name": "Movie.RELEASE/poster.jpg"},
+		]
+		qbt.rename_folder.return_value = True
+		qbt.wait_for_recheck.return_value = {"progress": 1}
+
+		with mock.patch.object(arr_qbt_sync, "move_remaining_source_items", return_value=False), \
+			mock.patch.object(arr_qbt_sync, "remove_source_folder", return_value=True), \
+			mock.patch.object(arr_qbt_sync, "cleanup_finished", return_value=True), \
+			mock.patch.object(arr_qbt_sync, "imported_videos_are_present", return_value=True), \
+			mock.patch.object(arr_qbt_sync, "clear_state") as clear_state, \
+			mock.patch.object(arr_qbt_sync, "trigger_jellyfin_scan") as trigger_scan:
+			arr_qbt_sync.finalize_transfer("radarr", qbt, "hash", self._state())
+
+		clear_state.assert_called_once_with("radarr", "hash")
+		trigger_scan.assert_called_once_with("/movies6/Movie (2026)")
 
 
 if __name__ == "__main__":

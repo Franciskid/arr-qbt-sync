@@ -12,6 +12,18 @@
     "/tv6": "/media6/TV Shows",
     "/data": "/data"
   },
+  "arr_to_jellyfin_paths": {
+    "/movies1": "/Media/Movies",
+    "/movies3": "/media3:ro/Movies",
+    "/movies4": "/media4:ro/Movies",
+    "/movies5": "/media5:ro/Movies",
+    "/movies6": "/media6:ro/Movies",
+    "/tv1": "/Media/TV Shows",
+    "/tv2": "/media2:ro/TV Shows",
+    "/tv4": "/media4:ro/TV Shows",
+    "/tv5": "/media5:ro/TV Shows",
+    "/tv6": "/media6:ro/TV Shows"
+  },
   "video_extensions": [
     ".mkv",
     ".mp4",

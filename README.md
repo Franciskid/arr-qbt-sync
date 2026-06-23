@@ -12,9 +12,10 @@ seeding.
 
 This script runs as a Radarr or Sonarr custom script after an import. It updates
 qBittorrent to use the imported file in its final library location. It then
-rechecks the torrent and removes the old source only when the new path is
-valid. The result is one library copy that can still be seeded, even when the
-download and library are on different drives.
+rechecks the torrent, removes the old source only when the new path is valid,
+and asks Jellyfin to scan after the files are in place. The result is one
+library copy that can still be seeded, even when the download and library are
+on different drives.
 
 ## How it works
 
@@ -34,6 +35,8 @@ torrent has a destination. It then:
 - moves the torrent between drives when the show's library is elsewhere;
 - moves remaining files such as subtitles and artwork into the destination;
 - rechecks the complete torrent before removing the old folder.
+- requests a Jellyfin library scan once the torrent is safely pointed at the
+  final files.
 
 This allows a season pack downloaded as one folder to become individual
 episodes under the existing TV library while qBittorrent continues seeding the
@@ -47,6 +50,8 @@ same torrent from its new location.
    and upgrade events.
 4. Set `ARR_QBT_HOST`, `ARR_QBT_PORT`, `ARR_QBT_USERNAME`, and
    `ARR_QBT_PASSWORD` in the Arr containers.
+5. To make Jellyfin scan after each completed sync, set
+   `ARR_QBT_JELLYFIN_URL` and `ARR_QBT_JELLYFIN_API_KEY`.
 
 Completed Download Handling can stay disabled if another part of your setup
 starts the import. This script only handles the path synchronization after Arr
