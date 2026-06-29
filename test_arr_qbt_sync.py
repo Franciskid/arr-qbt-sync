@@ -137,6 +137,54 @@ class SourceCleanupGuardTests(unittest.TestCase):
 			self.assertFalse(source.exists())
 			self.assertEqual(target_file.read_bytes(), b"movie")
 
+	def test_remove_source_folder_allows_verified_imported_copy(self):
+		with tempfile.TemporaryDirectory() as temp_dir:
+			root = Path(temp_dir)
+			source = root / "release"
+			target = root / "Movie (2026)"
+			source.mkdir()
+			target.mkdir()
+			source_file = source / "movie.mkv"
+			target_file = target / "movie.mkv"
+			source_file.write_bytes(b"movie")
+			target_file.write_bytes(b"movie")
+
+			result = arr_qbt_sync.remove_source_folder(
+				str(source),
+				[{
+					"source_path_arr": str(root / "old" / "movie.mkv"),
+					"imported_path_arr": str(target_file),
+				}],
+				allow_imported_copies=True,
+			)
+
+			self.assertTrue(result)
+			self.assertFalse(source.exists())
+			self.assertEqual(target_file.read_bytes(), b"movie")
+
+	def test_remove_source_folder_blocks_unmapped_video_copy(self):
+		with tempfile.TemporaryDirectory() as temp_dir:
+			root = Path(temp_dir)
+			source = root / "release"
+			target = root / "Movie (2026)"
+			source.mkdir()
+			target.mkdir()
+			(source / "other.mkv").write_bytes(b"movie")
+			target_file = target / "movie.mkv"
+			target_file.write_bytes(b"movie")
+
+			result = arr_qbt_sync.remove_source_folder(
+				str(source),
+				[{
+					"source_path_arr": str(root / "old" / "movie.mkv"),
+					"imported_path_arr": str(target_file),
+				}],
+				allow_imported_copies=True,
+			)
+
+			self.assertFalse(result)
+			self.assertTrue(source.exists())
+
 	def test_cleanup_finished_requires_all_source_folders_gone(self):
 		with tempfile.TemporaryDirectory() as temp_dir:
 			root = Path(temp_dir)
@@ -190,6 +238,39 @@ class RenameResilienceTests(unittest.TestCase):
 			side_effect=urllib.error.HTTPError("url", 409, "Conflict", {}, None)
 		)
 		self.assertFalse(client.rename_file("hash", "old", "new"))
+
+
+class DeleteEventTests(unittest.TestCase):
+	def test_upgrade_delete_removes_matching_torrent_and_files(self):
+		qbt = mock.Mock()
+		qbt.get_torrents.return_value = [{
+			"hash": "hash",
+			"save_path": "/Media/TV Shows",
+			"content_path": "/Media/TV Shows/Show/Season 1/old.mkv",
+		}]
+		qbt.get_files.return_value = [{
+			"name": "Show/Season 1/old.mkv",
+		}]
+
+		with mock.patch.dict(os.environ, {
+			"sonarr_delete_reason": "Upgrade",
+			"sonarr_episodefile_path": "/tv1/Show/Season 1/old.mkv",
+		}, clear=False):
+			arr_qbt_sync.handle_delete_event("sonarr", qbt)
+
+		qbt.delete_torrent.assert_called_once_with("hash", delete_files=True)
+
+	def test_non_upgrade_delete_is_ignored(self):
+		qbt = mock.Mock()
+
+		with mock.patch.dict(os.environ, {
+			"sonarr_delete_reason": "Manual",
+			"sonarr_episodefile_path": "/tv1/Show/Season 1/old.mkv",
+		}, clear=False):
+			arr_qbt_sync.handle_delete_event("sonarr", qbt)
+
+		qbt.get_torrents.assert_not_called()
+		qbt.delete_torrent.assert_not_called()
 
 
 class FinalizeRepointTests(unittest.TestCase):

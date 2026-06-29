@@ -350,6 +350,22 @@ def imported_match_for_source(source_path, mappings):
 	return None
 
 
+def imported_copy_matches_source(source_path, mappings):
+	source = Path(source_path)
+	if not source.is_file():
+		return False
+	for mapping in mappings:
+		imported = Path(mapping["imported_path_arr"])
+		if imported.name != source.name or not imported.is_file():
+			continue
+		try:
+			if imported.stat().st_size == source.stat().st_size:
+				return True
+		except OSError:
+			continue
+	return False
+
+
 def move_remaining_source_items(source_folder, target_folder):
 	source = Path(source_folder)
 	target = Path(target_folder)
@@ -377,13 +393,15 @@ def move_remaining_source_items(source_folder, target_folder):
 	return safe_to_remove_source
 
 
-def source_folder_has_unique_video(source_folder, mappings):
+def source_folder_has_unique_video(source_folder, mappings, allow_imported_copies=False):
 	source = Path(source_folder)
 	for child in source.rglob("*"):
 		if not child.is_file() or not is_video_file(child.name):
 			continue
 		imported_path = imported_match_for_source(child, mappings)
 		if imported_path and same_file(child, imported_path):
+			continue
+		if allow_imported_copies and imported_copy_matches_source(child, mappings):
 			continue
 		log(f"remove_source: blocking cleanup; unique video remains in source: {child}")
 		return True
@@ -402,12 +420,12 @@ def imported_videos_are_present(mappings):
 	return True
 
 
-def remove_source_folder(source_folder, mappings):
+def remove_source_folder(source_folder, mappings, allow_imported_copies=False):
 	source = Path(source_folder)
 	if not source.exists():
 		log(f"remove_source: does not exist: {source}")
 		return True
-	if source_folder_has_unique_video(source_folder, mappings):
+	if source_folder_has_unique_video(source_folder, mappings, allow_imported_copies):
 		return False
 	remaining = list(source.rglob("*"))
 	log(f"remove_source: deleting {source} ({len(remaining)} items remaining)")
@@ -528,9 +546,24 @@ class QBittorrentClient:
 			fail(f"Torrent {download_id} not found in qBittorrent")
 		return data[0]
 
+	def get_torrents(self):
+		raw = self._request("/api/v2/torrents/info")
+		return json.loads(raw)
+
 	def get_files(self, download_id):
 		raw = self._request(f"/api/v2/torrents/files?hash={download_id}")
 		return json.loads(raw)
+
+	def delete_torrent(self, download_id, delete_files=False):
+		log(f"qBittorrent delete: {download_id} delete_files={delete_files}")
+		self._request(
+			"/api/v2/torrents/delete",
+			method="POST",
+			data={
+				"hashes": download_id,
+				"deleteFiles": "true" if delete_files else "false",
+			},
+		)
 
 	def rename_folder(self, download_id, old_path, new_path):
 		log(f"qBittorrent renameFolder: {old_path} -> {new_path}")
@@ -636,11 +669,118 @@ def augment_state_from_target_files(state, qbt_files):
 	return changed
 
 
+def env_first(*names):
+	for name in names:
+		value = os.getenv(name, "")
+		if value:
+			return value
+	return ""
+
+
+def env_value_matching(*patterns):
+	for key, value in os.environ.items():
+		lower_key = key.lower()
+		if all(pattern in lower_key for pattern in patterns) and value:
+			return value
+	return ""
+
+
+def delete_reason(app_name):
+	return (
+		env_first(
+			f"{app_name}_delete_reason",
+			f"{app_name}_episodefile_deletereason",
+			f"{app_name}_moviefile_deletereason",
+			f"{app_name}_episodefile_delete_reason",
+			f"{app_name}_moviefile_delete_reason",
+		)
+		or env_value_matching(app_name, "delete", "reason")
+	)
+
+
+def deleted_file_path(app_name):
+	if app_name == "sonarr":
+		return (
+			env_first(
+				"sonarr_episodefile_path",
+				"sonarr_deletedrelativepaths",
+				"sonarr_deletedpaths",
+			)
+			or env_value_matching("sonarr", "episodefile", "path")
+			or env_value_matching("sonarr", "deleted", "path")
+		)
+	return (
+		env_first(
+			"radarr_moviefile_path",
+			"radarr_deletedrelativepaths",
+			"radarr_deletedpaths",
+		)
+		or env_value_matching("radarr", "moviefile", "path")
+		or env_value_matching("radarr", "deleted", "path")
+	)
+
+
+def torrent_file_absolute_paths(torrent, files):
+	save_path = torrent.get("save_path", "").rstrip("/")
+	content_path = torrent.get("content_path", "").rstrip("/")
+	paths = set()
+	if content_path:
+		paths.add(content_path)
+	for item in files:
+		name = item.get("name", "").lstrip("/")
+		if save_path and name:
+			paths.add(f"{save_path}/{name}")
+	return paths
+
+
+def find_torrents_for_qbt_path(qbt, target_path):
+	matches = []
+	for torrent in qbt.get_torrents():
+		torrent_hash = torrent.get("hash", "")
+		if not torrent_hash:
+			continue
+		files = qbt.get_files(torrent_hash)
+		if target_path in torrent_file_absolute_paths(torrent, files):
+			matches.append(torrent)
+	return matches
+
+
+def handle_delete_event(app_name, qbt):
+	reason = delete_reason(app_name)
+	if reason.lower() != "upgrade":
+		log(f"Ignoring delete event with reason: {reason or 'unknown'}")
+		return
+
+	path_arr = deleted_file_path(app_name)
+	if not path_arr:
+		log("Ignoring upgrade delete event without a file path")
+		return
+
+	try:
+		path_qbt = arr_to_qbt(path_arr)
+	except ValueError as error:
+		log(f"Ignoring upgrade delete event: {error}")
+		return
+
+	matches = find_torrents_for_qbt_path(qbt, path_qbt)
+	if not matches:
+		log(f"No qBittorrent torrent matched upgraded file: {path_qbt}")
+		return
+
+	for torrent in matches:
+		qbt.delete_torrent(torrent["hash"], delete_files=True)
+	log(f"Removed {len(matches)} upgraded qBittorrent torrent(s) for {path_qbt}")
+
+
 def collect_event(app_name):
 	event_type = os.getenv(f"{app_name}_eventtype", "")
 	if event_type == "Test":
 		log("Received test event")
 		raise SystemExit(0)
+	if event_type in ("EpisodeFileDelete", "MovieFileDelete"):
+		return {
+			"delete_event": True,
+		}
 	if event_type not in ("Download", "ImportComplete"):
 		log(f"Ignoring unsupported event type: {event_type}")
 		raise SystemExit(0)
@@ -836,7 +976,14 @@ def finalize_transfer(app_name, qbt, download_id, state):
 		log(f"Skipping unsafe source folder removal for Arr root: {source_folder_arr}")
 	if renamed_source_arr:
 		if not is_arr_root_path(renamed_source_arr):
-			cleanup_safe = remove_source_folder(renamed_source_arr, mappings) and cleanup_safe
+			cleanup_safe = (
+				remove_source_folder(
+					renamed_source_arr,
+					mappings,
+					allow_imported_copies=True,
+				)
+				and cleanup_safe
+			)
 		else:
 			log(f"Skipping unsafe source folder removal for Arr root: {renamed_source_arr}")
 		source_root_arr, _ = longest_prefix_match(source_folder_arr, ARR_TO_QBT_PATHS)
@@ -865,13 +1012,18 @@ def main():
 		fail("Could not detect Sonarr or Radarr environment")
 
 	event = collect_event(app_name)
+
+	qbt = QBittorrentClient()
+	qbt.login()
+	if event.get("delete_event"):
+		handle_delete_event(app_name, qbt)
+		return
+
 	download_id = event["download_id"]
 
 	state = load_state(app_name, download_id)
 	state = merge_mapping(state, event)
 
-	qbt = QBittorrentClient()
-	qbt.login()
 	qbt_files = qbt.get_files(download_id)
 	if augment_state_from_target_files(state, qbt_files):
 		log(f"Recovered additional imported files for {download_id} from target folder")
