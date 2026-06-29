@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import shutil
+import sqlite3
 import time
 import urllib.error
 import urllib.parse
@@ -350,13 +351,19 @@ def imported_match_for_source(source_path, mappings):
 	return None
 
 
-def imported_copy_matches_source(source_path, mappings):
+def imported_copy_matches_source(source_path, mappings, source_folder=None, target_folder=None):
 	source = Path(source_path)
 	if not source.is_file():
 		return False
 	for mapping in mappings:
 		imported = Path(mapping["imported_path_arr"])
-		if imported.name != source.name or not imported.is_file():
+		expected_sources = {Path(mapping["source_path_arr"])}
+		if source_folder and target_folder:
+			try:
+				expected_sources.add(Path(source_folder) / imported.relative_to(Path(target_folder)))
+			except ValueError:
+				pass
+		if source not in expected_sources or not imported.is_file():
 			continue
 		try:
 			if imported.stat().st_size == source.stat().st_size:
@@ -393,7 +400,12 @@ def move_remaining_source_items(source_folder, target_folder):
 	return safe_to_remove_source
 
 
-def source_folder_has_unique_video(source_folder, mappings, allow_imported_copies=False):
+def source_folder_has_unique_video(
+	source_folder,
+	mappings,
+	allow_imported_copies=False,
+	target_folder=None,
+):
 	source = Path(source_folder)
 	for child in source.rglob("*"):
 		if not child.is_file() or not is_video_file(child.name):
@@ -401,7 +413,12 @@ def source_folder_has_unique_video(source_folder, mappings, allow_imported_copie
 		imported_path = imported_match_for_source(child, mappings)
 		if imported_path and same_file(child, imported_path):
 			continue
-		if allow_imported_copies and imported_copy_matches_source(child, mappings):
+		if allow_imported_copies and imported_copy_matches_source(
+			child,
+			mappings,
+			source_folder=source_folder,
+			target_folder=target_folder,
+		):
 			continue
 		log(f"remove_source: blocking cleanup; unique video remains in source: {child}")
 		return True
@@ -420,12 +437,17 @@ def imported_videos_are_present(mappings):
 	return True
 
 
-def remove_source_folder(source_folder, mappings, allow_imported_copies=False):
+def remove_source_folder(source_folder, mappings, allow_imported_copies=False, target_folder=None):
 	source = Path(source_folder)
 	if not source.exists():
 		log(f"remove_source: does not exist: {source}")
 		return True
-	if source_folder_has_unique_video(source_folder, mappings, allow_imported_copies):
+	if source_folder_has_unique_video(
+		source_folder,
+		mappings,
+		allow_imported_copies,
+		target_folder,
+	):
 		return False
 	remaining = list(source.rglob("*"))
 	log(f"remove_source: deleting {source} ({len(remaining)} items remaining)")
@@ -745,6 +767,64 @@ def find_torrents_for_qbt_path(qbt, target_path):
 	return matches
 
 
+def path_is_currently_tracked_by_sonarr(path_arr):
+	db_path = Path("/config/sonarr.db")
+	if not db_path.exists():
+		return True
+	try:
+		connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+		try:
+			row = connection.execute(
+				"""
+				select 1
+				from EpisodeFiles ef
+				join Series s on s.Id = ef.SeriesId
+				where s.Path || '/' || ef.RelativePath = ?
+				limit 1
+				""",
+				(path_arr,),
+			).fetchone()
+		finally:
+			connection.close()
+	except sqlite3.Error as error:
+		log(f"Unable to verify Sonarr tracking for {path_arr}: {error}")
+		return True
+	return row is not None
+
+
+def path_is_currently_tracked_by_radarr(path_arr):
+	db_path = Path("/config/radarr.db")
+	if not db_path.exists():
+		return True
+	try:
+		connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+		try:
+			row = connection.execute(
+				"""
+				select 1
+				from MovieFiles mf
+				join Movies m on m.Id = mf.MovieId
+				where m.Path || '/' || mf.RelativePath = ?
+				limit 1
+				""",
+				(path_arr,),
+			).fetchone()
+		finally:
+			connection.close()
+	except sqlite3.Error as error:
+		log(f"Unable to verify Radarr tracking for {path_arr}: {error}")
+		return True
+	return row is not None
+
+
+def path_is_currently_tracked(app_name, path_arr):
+	if app_name == "sonarr":
+		return path_is_currently_tracked_by_sonarr(path_arr)
+	if app_name == "radarr":
+		return path_is_currently_tracked_by_radarr(path_arr)
+	return True
+
+
 def handle_delete_event(app_name, qbt):
 	reason = delete_reason(app_name)
 	if reason.lower() != "upgrade":
@@ -767,9 +847,13 @@ def handle_delete_event(app_name, qbt):
 		log(f"No qBittorrent torrent matched upgraded file: {path_qbt}")
 		return
 
+	delete_files = Path(path_arr).exists() and not path_is_currently_tracked(app_name, path_arr)
 	for torrent in matches:
-		qbt.delete_torrent(torrent["hash"], delete_files=True)
-	log(f"Removed {len(matches)} upgraded qBittorrent torrent(s) for {path_qbt}")
+		qbt.delete_torrent(torrent["hash"], delete_files=delete_files)
+	log(
+		f"Removed {len(matches)} upgraded qBittorrent torrent(s) for {path_qbt}; "
+		f"delete_files={delete_files}"
+	)
 
 
 def collect_event(app_name):
@@ -981,6 +1065,7 @@ def finalize_transfer(app_name, qbt, download_id, state):
 					renamed_source_arr,
 					mappings,
 					allow_imported_copies=True,
+					target_folder=target_root_arr,
 				)
 				and cleanup_safe
 			)
