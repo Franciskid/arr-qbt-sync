@@ -16,6 +16,8 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = Path(os.getenv("ARR_QBT_SYNC_CONFIG", SCRIPT_DIR / "config.json"))
 LOG_DIR = Path(os.getenv("ARR_QBT_SYNC_STATE_DIR", "/config/arr-qbt-sync"))
 LOG_DIR.mkdir(parents=True, exist_ok=True)
+RECHECK_TIMEOUT_SECONDS = int(os.getenv("ARR_QBT_RECHECK_TIMEOUT_SECONDS", "1800"))
+LOCATION_SETTLE_TIMEOUT_SECONDS = int(os.getenv("ARR_QBT_LOCATION_SETTLE_TIMEOUT_SECONDS", "300"))
 
 _logger = logging.getLogger("arr_qbt_sync")
 _logger.setLevel(logging.DEBUG)
@@ -632,13 +634,19 @@ class QBittorrentClient:
 			data={"hashes": download_id},
 		)
 
+	def stop(self, download_id):
+		self._post_with_fallback(
+			["/api/v2/torrents/stop", "/api/v2/torrents/pause"],
+			data={"hashes": download_id},
+		)
+
 	def resume(self, download_id):
 		self._post_with_fallback(
 			["/api/v2/torrents/resume", "/api/v2/torrents/start"],
 			data={"hashes": download_id},
 		)
 
-	def wait_for_recheck(self, download_id, timeout_seconds=300):
+	def wait_for_recheck(self, download_id, timeout_seconds=RECHECK_TIMEOUT_SECONDS):
 		deadline = time.time() + timeout_seconds
 		start_deadline = min(deadline, time.time() + 15)
 		saw_checking = False
@@ -650,6 +658,17 @@ class QBittorrentClient:
 			if is_checking:
 				saw_checking = True
 			elif saw_checking or time.time() >= start_deadline:
+				return last_torrent
+			time.sleep(2)
+		return last_torrent or self.get_torrent(download_id)
+
+	def wait_for_location_settle(self, download_id, expected_location, timeout_seconds=LOCATION_SETTLE_TIMEOUT_SECONDS):
+		deadline = time.time() + timeout_seconds
+		last_torrent = None
+		while time.time() < deadline:
+			last_torrent = self.get_torrent(download_id)
+			state = last_torrent.get("state", "").lower()
+			if last_torrent.get("save_path") == expected_location and "moving" not in state:
 				return last_torrent
 			time.sleep(2)
 		return last_torrent or self.get_torrent(download_id)
@@ -993,7 +1012,13 @@ def finalize_transfer(app_name, qbt, download_id, state):
 				repoint_complete = False
 
 	if location_changed:
+		qbt.stop(download_id)
 		qbt.set_location(download_id, library_root_qbt)
+		torrent = qbt.wait_for_location_settle(download_id, library_root_qbt)
+		log(
+			f"qBittorrent location settle: save_path={torrent.get('save_path')} "
+			f"state={torrent.get('state')}"
+		)
 
 	if not repoint_complete:
 		log(

@@ -239,6 +239,21 @@ class RecheckTests(unittest.TestCase):
 
 		self.assertEqual(result["progress"], 1)
 
+	@mock.patch.object(arr_qbt_sync.time, "sleep")
+	def test_wait_for_location_settle_waits_until_move_finishes(self, _sleep):
+		client = object.__new__(arr_qbt_sync.QBittorrentClient)
+		states = iter([
+			{"save_path": "/old", "state": "movingUP"},
+			{"save_path": "/new", "state": "movingUP"},
+			{"save_path": "/new", "state": "stoppedUP"},
+		])
+		client.get_torrent = lambda _download_id: next(states)
+
+		result = client.wait_for_location_settle("hash", "/new", timeout_seconds=20)
+
+		self.assertEqual(result["save_path"], "/new")
+		self.assertEqual(result["state"], "stoppedUP")
+
 
 class RenameResilienceTests(unittest.TestCase):
 	def _client(self):
@@ -264,6 +279,17 @@ class RenameResilienceTests(unittest.TestCase):
 			side_effect=urllib.error.HTTPError("url", 409, "Conflict", {}, None)
 		)
 		self.assertFalse(client.rename_file("hash", "old", "new"))
+
+	def test_stop_uses_qbittorrent_v5_endpoint(self):
+		client = self._client()
+		client._post_with_fallback = mock.Mock()
+
+		client.stop("hash")
+
+		client._post_with_fallback.assert_called_once_with(
+			["/api/v2/torrents/stop", "/api/v2/torrents/pause"],
+			data={"hashes": "hash"},
+		)
 
 
 class DeleteEventTests(unittest.TestCase):
@@ -400,6 +426,34 @@ class FinalizeRepointTests(unittest.TestCase):
 
 		clear_state.assert_called_once_with("radarr", "hash")
 		trigger_scan.assert_called_once_with("/movies6/Movie (2026)")
+
+	def test_cross_drive_finalize_stops_before_set_location(self):
+		state = self._state()
+		state["target_root_arr"] = "/movies1/Movie (2026)"
+		state["target_root_qbt"] = "/Media/Movies/Movie (2026)"
+		state["library_root_qbt"] = "/Media/Movies"
+		state["library_item_root_arr"] = "/movies1/Movie (2026)"
+		state["mappings"] = [
+			arr_qbt_sync.build_mapping(
+				"/movies6/Movie.RELEASE/Movie.RELEASE.mkv",
+				"/movies1/Movie (2026)/Movie.RELEASE.mkv",
+			)
+		]
+		qbt = mock.Mock()
+		qbt.get_torrent.return_value = {"save_path": "/media6/Movies", "state": "stalledUP", "progress": 1}
+		qbt.get_files.return_value = [{"name": "Movie.RELEASE/Movie.RELEASE.mkv"}]
+		qbt.rename_folder.return_value = True
+		qbt.wait_for_location_settle.return_value = {"save_path": "/Media/Movies", "state": "stoppedUP"}
+		qbt.wait_for_recheck.return_value = {"progress": 1}
+
+		with mock.patch.object(arr_qbt_sync, "move_remaining_source_items", return_value=True), \
+			mock.patch.object(arr_qbt_sync, "remove_source_folder", return_value=True), \
+			mock.patch.object(arr_qbt_sync, "imported_videos_are_present", return_value=True), \
+			mock.patch.object(arr_qbt_sync, "clear_state"), \
+			mock.patch.object(arr_qbt_sync, "trigger_jellyfin_scan"):
+			arr_qbt_sync.finalize_transfer("radarr", qbt, "hash", state)
+
+		self.assertLess(qbt.method_calls.index(mock.call.stop("hash")), qbt.method_calls.index(mock.call.set_location("hash", "/Media/Movies")))
 
 
 if __name__ == "__main__":
